@@ -273,65 +273,6 @@ class AttentionBlock(torch.nn.Module):
         return t
 
     @profile
-    def forward_2(self,
-                x: torch.Tensor,
-                past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-                start_pos: int = 0,
-                ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        t = self.norm(x)
-        qkv = self.qkv(t)
-
-        q = qkv[:, : self.num_attention_heads * self.head_dim]
-        k = qkv[:, self.num_attention_heads * self.head_dim: (
-                    self.num_attention_heads + self.num_key_value_heads) * self.head_dim]
-        v = qkv[:, (self.num_attention_heads + self.num_key_value_heads) * self.head_dim:]
-
-        q = q.view(-1, self.num_attention_heads, self.head_dim)
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
-
-        q, k = self.rope(q, k, start_pos=start_pos)
-
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k = torch.cat([past_k, k], dim=0)
-            v = torch.cat([past_v, v], dim=0)
-
-        new_kv = (k, v)
-
-        num_groups = self.num_attention_heads // self.num_key_value_heads
-        k_expanded = k.repeat_interleave(num_groups, dim=1)
-        v_expanded = v.repeat_interleave(num_groups, dim=1)
-
-        query_len, num_heads, head_dim = q.shape
-        key_len = k_expanded.shape[0]
-
-        QK = torch.einsum("qhd,khd->hqk", q, k_expanded)
-        QK *= self.sm_scale
-
-        all_indices = torch.arange(key_len, device=x.device)
-        query_indices = torch.arange(start_pos, start_pos + query_len, device=x.device)
-        mask = query_indices[:, None] < all_indices[None, :]
-        QK = QK.masked_fill(mask, -torch.inf)
-
-        if self.sliding_window > 0:
-            sliding_mask = query_indices[:, None] < (all_indices[None, :] + self.sliding_window)
-            QK = QK.masked_fill(~sliding_mask, -torch.inf)
-
-        S = self.sinks.view(num_heads, 1, 1).expand(-1, query_len, -1)
-        QK = torch.cat([QK, S], dim=-1)
-
-        W = torch.softmax(QK, dim=-1)
-        W = W[..., :-1]
-
-        attn = torch.einsum("hqk,khd->qhd", W, v_expanded)
-
-        t = attn.reshape(-1, self.num_attention_heads * self.head_dim)
-        t = self.out(t)
-
-        return t, new_kv
-
-    @profile
     def forward(self,
                 x: torch.Tensor,
                 past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
