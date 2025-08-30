@@ -18,6 +18,7 @@
 <li>Optimized forward pass and attention</li>
 </ul>
 
+<iframe width="560" height="315" src="https://www.youtube.com/embed/0g7MBALZM8c?si=8zi2QJw7KP2XeVnq" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
 __________________________________________
 
 Welcome to the gpt-oss series, [OpenAI's open-weight models](https://openai.com/open-models/) designed for powerful reasoning, agentic tasks, and versatile developer use cases.
