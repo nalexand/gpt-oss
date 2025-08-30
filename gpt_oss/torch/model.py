@@ -8,6 +8,11 @@ import torch.distributed as dist
 
 from gpt_oss.torch.weights import Checkpoint
 
+try:
+    profile # type: ignore
+except NameError:
+    profile = lambda f: f
+
 
 @dataclass
 class ModelConfig:
@@ -58,6 +63,23 @@ def _apply_rotary_emb(
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     return torch.cat((o1, o2), dim=-1)
+
+def _apply_rotary_emb_optimized(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+) -> torch.Tensor:
+    # Prepare cos/sin with correct shape and dtype outside this function
+    # Use direct indexing instead of chunk for better memory efficiency
+    half_dim = x.size(-1) // 2
+    x1, x2 = x[..., :half_dim], x[..., half_dim:]
+
+    # Compute in-place where possible
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+
+    # Use view instead of cat to avoid memory allocation
+    return torch.cat([o1, o2], dim=-1)  # Still need cat, but optimized other parts
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -122,31 +144,36 @@ class RotaryEmbedding(torch.nn.Module):
 
         return concentration, inv_freq
 
-    def _compute_cos_sin(self, num_tokens: int):
+    def _compute_cos_sin(self, num_tokens: int, start_pos: int = 0):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
+        t = torch.arange(start_pos, start_pos + num_tokens, dtype=torch.float32, device=self.device)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
         return cos, sin
 
+    @profile
     def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            start_pos: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        cos, sin = self._compute_cos_sin(num_tokens, start_pos=start_pos)
+        cos = cos.unsqueeze(-2).to(query.dtype)
+        sin = sin.unsqueeze(-2).to(query.dtype)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_dim)
-        query = _apply_rotary_emb(query, cos, sin)
+        query = _apply_rotary_emb_optimized(query, cos, sin)
         query = query.reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_dim)
-        key = _apply_rotary_emb(key, cos, sin)
+        key = _apply_rotary_emb_optimized(key, cos, sin)
         key = key.reshape(key_shape)
+
         return query, key
 
 
@@ -214,7 +241,7 @@ class AttentionBlock(torch.nn.Module):
             device=device,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
@@ -245,6 +272,132 @@ class AttentionBlock(torch.nn.Module):
         t = x + t
         return t
 
+    @profile
+    def forward_2(self,
+                x: torch.Tensor,
+                past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+                start_pos: int = 0,
+                ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        t = self.norm(x)
+        qkv = self.qkv(t)
+
+        q = qkv[:, : self.num_attention_heads * self.head_dim]
+        k = qkv[:, self.num_attention_heads * self.head_dim: (
+                    self.num_attention_heads + self.num_key_value_heads) * self.head_dim]
+        v = qkv[:, (self.num_attention_heads + self.num_key_value_heads) * self.head_dim:]
+
+        q = q.view(-1, self.num_attention_heads, self.head_dim)
+        k = k.view(-1, self.num_key_value_heads, self.head_dim)
+        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+
+        q, k = self.rope(q, k, start_pos=start_pos)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=0)
+            v = torch.cat([past_v, v], dim=0)
+
+        new_kv = (k, v)
+
+        num_groups = self.num_attention_heads // self.num_key_value_heads
+        k_expanded = k.repeat_interleave(num_groups, dim=1)
+        v_expanded = v.repeat_interleave(num_groups, dim=1)
+
+        query_len, num_heads, head_dim = q.shape
+        key_len = k_expanded.shape[0]
+
+        QK = torch.einsum("qhd,khd->hqk", q, k_expanded)
+        QK *= self.sm_scale
+
+        all_indices = torch.arange(key_len, device=x.device)
+        query_indices = torch.arange(start_pos, start_pos + query_len, device=x.device)
+        mask = query_indices[:, None] < all_indices[None, :]
+        QK = QK.masked_fill(mask, -torch.inf)
+
+        if self.sliding_window > 0:
+            sliding_mask = query_indices[:, None] < (all_indices[None, :] + self.sliding_window)
+            QK = QK.masked_fill(~sliding_mask, -torch.inf)
+
+        S = self.sinks.view(num_heads, 1, 1).expand(-1, query_len, -1)
+        QK = torch.cat([QK, S], dim=-1)
+
+        W = torch.softmax(QK, dim=-1)
+        W = W[..., :-1]
+
+        attn = torch.einsum("hqk,khd->qhd", W, v_expanded)
+
+        t = attn.reshape(-1, self.num_attention_heads * self.head_dim)
+        t = self.out(t)
+
+        return t, new_kv
+
+    @profile
+    def forward(self,
+                x: torch.Tensor,
+                past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+                start_pos: int = 0,
+                ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        t = self.norm(x)
+        qkv = self.qkv(t)
+
+        q_end = self.num_attention_heads * self.head_dim
+        k_end = q_end + self.num_key_value_heads * self.head_dim
+        q = qkv[:, :q_end]
+        k = qkv[:, q_end:k_end]
+        v = qkv[:, k_end:]
+
+        q = q.view(-1, self.num_attention_heads, self.head_dim)
+        k = k.view(-1, self.num_key_value_heads, self.head_dim)
+        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+
+        q, k = self.rope(q, k, start_pos=start_pos)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=0)
+            v = torch.cat([past_v, v], dim=0)
+
+        new_kv = (k, v)
+        num_groups = self.num_attention_heads // self.num_key_value_heads
+
+        k_expanded = k.repeat_interleave(num_groups, dim=1)
+        v_expanded = v.repeat_interleave(num_groups, dim=1)
+
+        query_len, num_heads, head_dim = q.shape
+        key_len = k_expanded.shape[0]
+
+        q_permuted = q.permute(1, 0, 2)
+        k_permuted = k_expanded.permute(1, 0, 2)
+        QK = torch.bmm(q_permuted, k_permuted.transpose(1, 2))
+        QK *= self.sm_scale
+
+        all_indices = torch.arange(key_len, device=x.device)
+        query_indices = torch.arange(start_pos, start_pos + query_len, device=x.device)
+
+        causal_mask = query_indices[:, None] < all_indices[None, :]
+
+        mask = causal_mask
+
+        if self.sliding_window > 0:
+            sliding_mask = query_indices[:, None] < (all_indices[None, :] + self.sliding_window)
+            mask = mask | ~sliding_mask
+
+        QK = QK.masked_fill(mask, -torch.inf)
+
+        S = self.sinks.view(num_heads, 1, 1).expand(-1, query_len, -1)
+        QK = torch.cat([QK, S], dim=-1)
+
+        W = torch.softmax(QK, dim=-1)
+        W = W[..., :-1]
+
+        v_permuted = v_expanded.permute(1, 0, 2)
+        attn = torch.bmm(W, v_permuted)
+        attn = attn.permute(1, 0, 2)
+
+        t = attn.reshape(-1, self.num_attention_heads * self.head_dim)
+        t = self.out(t)
+
+        return t, new_kv
 
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -348,44 +501,133 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x)
+    @profile
+    def forward(self,
+                x: torch.Tensor,
+                past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+                start_pos: int = 0,
+                ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        attn_output, new_kv = self.attn(x, past_kv, start_pos)
+        x = x + attn_output
         x = self.mlp(x)
-        return x
+        return x, new_kv
 
+checkpoint = None
 
 class Transformer(torch.nn.Module):
     def __init__(
         self,
         config: ModelConfig,
         device: torch.device | None = None,
+        lazy_load: bool = True,
     ):
         super().__init__()
-        self.embedding = torch.nn.Embedding(
-            config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
-        )
-        self.block = torch.nn.ModuleList(
-            [
-                TransformerBlock(config, layer_idx, device)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        self.unembedding = torch.nn.Linear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            device=device,
-            dtype=torch.bfloat16,
-        )
+        # lazy load layers
+        self.lazy_load = lazy_load
+        if not self.lazy_load:
+            self.embedding = torch.nn.Embedding(
+                config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
+            )
+        self.config = config
+        self.device = device
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
-        for block in self.block:
-            x = block(x)
+        if not self.lazy_load:
+            self.block = torch.nn.ModuleList(
+                [
+                    TransformerBlock(config, layer_idx, device)
+                    for layer_idx in range(config.num_hidden_layers)
+                ]
+            )
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        if not self.lazy_load:
+            self.unembedding = torch.nn.Linear(
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+
+    @profile
+    def forward(self,
+                x: torch.Tensor,
+                kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+                start_pos: int = 0,
+                ) -> tuple[
+        torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
+        if self.lazy_load:
+            embedding = torch.nn.Embedding(
+                self.config.vocab_size, self.config.hidden_size, device=self.device, dtype=torch.bfloat16
+            )
+            for name, param in embedding.named_parameters():
+                self.load_weights(param, f"embedding.{name}")
+            x = embedding(x)
+            del embedding
+        else:
+            x = self.embedding(x)
+
+        if kv_cache is None:
+            kv_cache = [None] * self.config.num_hidden_layers
+
+        if self.lazy_load:
+            for layer_idx in range(self.config.num_hidden_layers):
+                block = TransformerBlock(self.config, layer_idx, self.device)
+                for name, param in block.named_parameters():
+                    self.load_weights(param, f"block.{layer_idx}.{name}")
+                past_kv_for_layer = kv_cache[layer_idx]
+                x, new_kv_for_layer = block(x, past_kv_for_layer, start_pos)
+                kv_cache[layer_idx] = new_kv_for_layer
+                del block
+        else:
+            for layer_idx in range(self.config.num_hidden_layers):
+                past_kv_for_layer = kv_cache[layer_idx]
+                x, new_kv_for_layer = self.block[layer_idx](x, past_kv_for_layer, start_pos)
+                kv_cache[layer_idx] = new_kv_for_layer
+
         x = self.norm(x)
-        x = self.unembedding(x)
-        return x
+
+        if self.lazy_load:
+            unembedding = torch.nn.Linear(
+                self.config.hidden_size,
+                self.config.vocab_size,
+                bias=False,
+                device=self.device,
+                dtype=torch.bfloat16,
+             )
+            for name, param in unembedding.named_parameters():
+                self.load_weights(param, f"unembedding.{name}")
+            x = unembedding(x)
+            del unembedding
+        else:
+            x = self.unembedding(x)
+        return x, kv_cache
+
+    def load_weights(self, param, name):
+        global checkpoint
+        my_rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        per_rank_intermediate_size = self.config.intermediate_size // world_size
+        loaded_tensor = checkpoint.get(name)
+        if "mlp1" in name:
+            loaded_tensor = loaded_tensor[
+                :,
+                my_rank * 2
+                * per_rank_intermediate_size: (my_rank + 1) * 2
+                                              * per_rank_intermediate_size,
+                ...,
+                ]
+        elif "mlp2_weight" in name:
+            loaded_tensor = loaded_tensor[
+                ...,
+                my_rank
+                * per_rank_intermediate_size: (my_rank + 1)
+                                              * per_rank_intermediate_size,
+                ]
+        try:
+            param.data.copy_(loaded_tensor)
+        except:
+            print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
+            raise
 
     @staticmethod
     def from_checkpoint(
@@ -410,6 +652,7 @@ class Transformer(torch.nn.Module):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         per_rank_intermediate_size = config.intermediate_size // world_size
 
+        global checkpoint
         checkpoint = Checkpoint(path, device)
 
         for name, param in model.named_parameters():
@@ -455,16 +698,20 @@ class TokenGenerator:
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
         tokens = list(prompt_tokens)
+        num_prompt_tokens = len(tokens)
         num_generated_tokens = 0
+
+        kv_cache = None
+        prompt_tensor = torch.as_tensor(tokens, dtype=torch.int32, device=self.device)
+        logits, kv_cache = self.model(prompt_tensor, kv_cache=None, start_pos=0)
+        logits = logits[-1]
+
         while max_tokens == 0 or num_generated_tokens < max_tokens:
-            logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
             if temperature == 0.0:
                 predicted_token = torch.argmax(logits, dim=-1).item()
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
                 predicted_token = torch.multinomial(probs, num_samples=1).item()
-            tokens.append(predicted_token)
-            num_generated_tokens += 1
 
             if return_logprobs:
                 logprobs = torch.log_softmax(logits, dim=-1)
@@ -475,3 +722,10 @@ class TokenGenerator:
 
             if predicted_token in stop_tokens:
                 break
+
+            tokens.append(predicted_token)
+            num_generated_tokens += 1
+            next_token_tensor = torch.as_tensor([predicted_token], dtype=torch.int32, device=self.device)
+            start_pos = num_prompt_tokens + num_generated_tokens - 1
+            logits, kv_cache = self.model(next_token_tensor, kv_cache=kv_cache, start_pos=start_pos)
+            logits = logits[0]

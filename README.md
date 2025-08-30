@@ -10,6 +10,15 @@
 </p>
 
 <br>
+<h1>GPT-OSS-20B optimized to run on 8GB VRAM</h1>
+<ul> 
+<li>Use lazy load for Transformer layears (2.5 times slower than without lazy load, but can be runned on 8GB 3070Ti Laptop with 32GB RAM)</li>
+<li>Added kv_cache to speed up inference (torch)</li>
+<li>Optimized weight loading speed</li>
+<li>Optimized forward pass and attention</li>
+</ul>
+
+__________________________________________
 
 Welcome to the gpt-oss series, [OpenAI's open-weight models](https://openai.com/open-models/) designed for powerful reasoning, agentic tasks, and versatile developer use cases.
 
@@ -198,6 +207,17 @@ And then run:
 # On 4xH100:
 torchrun --nproc-per-node=4 -m gpt_oss.generate gpt-oss-120b/original/
 ```
+
+# Windows run example
+```shell
+python -m gpt_oss.generate --backend torch gpt-oss-20b/original/ -p "Hi" -l 10
+
+```
+#with profiler
+```shell
+kernprof -l -v -m gpt_oss.generate --backend torch gpt-oss-20b/original/ -p "Hi" -l 10
+```
+
 
 ## Reference Triton implementation (single GPU)
 

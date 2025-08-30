@@ -4,6 +4,11 @@ import os
 import torch
 from safetensors import safe_open
 
+try:
+    profile # type: ignore
+except NameError:
+    profile = lambda f: f
+
 
 # Bytes per MXFP4 block: 32 FP4 numbers packed in 16 bytes
 BYTES_PER_BLOCK = 16
@@ -33,6 +38,7 @@ class Checkpoint:
             else device.type + ":" + str(device.index)
         )
         self.device_str = device_str
+        self.file_handles = {}
 
         # Read from all files ending with .safetensors in the checkpoint directory
         safetensor_files = [
@@ -43,11 +49,30 @@ class Checkpoint:
         # Build a mapping from tensor name to (file, key)
         tensor_name_to_file = {}
         for safetensor_file in safetensor_files:
-            with safe_open(safetensor_file, framework="pt", device=device_str) as f:
-                for key in f.keys():
-                    tensor_name_to_file[key] = safetensor_file
+            handle = safe_open(safetensor_file, framework="pt", device='cpu')
+            self.file_handles[safetensor_file] = handle
+            for key in handle.keys():
+                tensor_name_to_file[key] = safetensor_file
 
         self.tensor_name_to_file = tensor_name_to_file
+        self._lut = torch.tensor(FP4_VALUES, dtype=torch.bfloat16, device=device)
+
+    @profile
+    def _get_tensor(self, name: str) -> torch.Tensor:
+        assert name in self.tensor_name_to_file, f"Tensor {name} not found."
+        file_key = self.tensor_name_to_file[name]
+        handle = self.file_handles[file_key]
+
+        # Get tensor and pin memory for faster GPU transfers
+        tensor = handle.get_tensor(name)
+        if self.device_str.startswith('cuda'):
+            tensor = tensor.pin_memory()
+
+        return tensor.to(self.device_str, non_blocking=True)
+
+    def __del__(self):
+        for handle in self.file_handles.values():
+            pass
 
     def get(self, name: str) -> torch.Tensor:
         match PARAM_NAME_MAP.get(name, name):
@@ -58,13 +83,7 @@ class Checkpoint:
                 # MoE biases and other weights
                 return self._get_tensor(tensor_name)
 
-    def _get_tensor(self, name: str) -> str:
-        assert name in self.tensor_name_to_file, f"Tensor {name} not found in checkpoint."
-        with safe_open(
-            self.tensor_name_to_file[name], framework="pt", device=self.device_str
-        ) as f:
-            return f.get_tensor(name)
-
+    @profile
     def _get_mxfp4_tensor(
         self,
         blocks_name: str,
@@ -87,7 +106,7 @@ class Checkpoint:
             f"{blocks.shape=} does not match {scales.shape=}"
         )
 
-        lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
+        lut = self._lut
 
         *prefix_shape, G, B = blocks.shape
         rows_total   = math.prod(prefix_shape) * G
@@ -103,9 +122,8 @@ class Checkpoint:
             blk = blocks[r0:r1]
             exp = scales[r0:r1]
 
-            # nibble indices -> int64
-            idx_lo = (blk & 0x0F).to(torch.long)
-            idx_hi = (blk >> 4).to(torch.long)
+            idx_lo = torch.bitwise_and(blk, 0x0F).long()
+            idx_hi = torch.bitwise_right_shift(blk, 4).long()
 
             sub = out[r0:r1]
             sub[:, 0::2] = lut[idx_lo]

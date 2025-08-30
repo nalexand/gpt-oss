@@ -7,7 +7,17 @@ import argparse
 
 from gpt_oss.tokenizer import get_tokenizer
 
+from line_profiler import profile
 
+try:
+    profile # type: ignore
+except NameError:
+    profile = lambda f: f
+
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+
+@profile
 def main(args):
     match args.backend:
         case "torch":
