@@ -32,6 +32,8 @@ This is a list of guides and resources to help you get started with the gpt-oss 
   - [gpt-oss on RTX](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss)
 - AMD
   - [Running gpt-oss models on AMD Ryzen AI Processors and Radeon Graphics Cards](https://www.amd.com/en/blogs/2025/how-to-run-openai-gpt-oss-20b-120b-models-on-amd-ryzen-ai-radeon.html)
+- Lemonade
+  - [Running gpt-oss on STX Halo and Radeon dGPUs using Lemonade](https://lemonade-server.ai/news/gpt-oss.html)
 - llama.cpp
   - [Running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
 
@@ -65,6 +67,8 @@ This is a list of guides and resources to help you get started with the gpt-oss 
   - [gpt-oss-20b on Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/models/gpt-oss-20b)
 - AMD
   - [gpt-oss-120B on AMD MI300X](https://huggingface.co/spaces/amd/gpt-oss-120b-chatbot)
+- AWS (Deploy via Tensorfuse)
+  - [Deploy gpt-oss for both 20b and 120b models on AWS EKS](https://tensorfuse.io/docs/guides/modality/text/openai_oss)
 
 ## Examples & Tutorials
 
