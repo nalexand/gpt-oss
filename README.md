@@ -24,7 +24,8 @@ Watch GPT-OSS 20B running on just 8GB of VRAM:
 
 [![GPT-OSS 20B Demo](https://englyk.com/gpt-oss-20b-8gb-vram.jpg)](https://englyk.com/gpt_oss_20b_8gb_vram.mp4)
 
-*Click the image to watch the full demonstration*
+*Click the image to watch the full demonstration* or -
+[Watch on YouTube](https://youtu.be/0g7MBALZM8c)
 __________________________________________
 
 Welcome to the gpt-oss series, [OpenAI's open-weight models](https://openai.com/open-models/) designed for powerful reasoning, agentic tasks, and versatile developer use cases.
