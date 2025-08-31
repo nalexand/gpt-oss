@@ -9,8 +9,6 @@ import datetime
 import os
 from pathlib import Path
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
-
 try:
     import gnureadline as readline
 except ImportError:
@@ -74,7 +72,7 @@ def main(args):
             from gpt_oss.torch.model import TokenGenerator as TorchGenerator
             from gpt_oss.torch.utils import init_distributed
             device = init_distributed()
-            generator = TorchGenerator(args.checkpoint, device)
+            generator = TorchGenerator(args.checkpoint, device, pin_memory=False)
         case "vllm":
             from gpt_oss.vllm.token_generator import TokenGenerator as VLLMGenerator
             generator = VLLMGenerator(args.checkpoint, tensor_parallel_size=2)
@@ -85,8 +83,8 @@ def main(args):
 
     system_message_content = (
         SystemContent.new()
-        #.with_reasoning_effort(REASONING_EFFORT[args.reasoning_effort])
-        #.with_conversation_start_date(datetime.datetime.now().strftime("%Y-%m-%d"))
+        .with_reasoning_effort(REASONING_EFFORT[args.reasoning_effort])
+        .with_conversation_start_date(datetime.datetime.now().strftime("%Y-%m-%d"))
     )
 
     if args.browser:

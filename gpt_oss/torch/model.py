@@ -534,19 +534,17 @@ class Transformer(torch.nn.Module):
         config: ModelConfig,
         device: torch.device | None = None,
         lazy_load: bool = True,
-        extreme_low_memory: bool = False,
+        extremly_low_memory: bool = False,
     ):
         super().__init__()
         free_mem = get_free_gpu_memory_gb()
         if free_mem < 6:
             lazy_load = True
-            extreme_low_memory = True
+            extremly_low_memory = True
         elif free_mem < 8:
             lazy_load = True
         self.lazy_load = lazy_load
-        self.lazy_load_embedding = lazy_load
-        self.lazy_load_unembedding = lazy_load
-        self.extreme_low_memory = extreme_low_memory
+        self.extremly_low_memory = extremly_low_memory
         self.config = config
         self.device = device
         self.loaded = {0: False, 1: False, 2: False}
@@ -562,11 +560,9 @@ class Transformer(torch.nn.Module):
                 ]
             )
             self.norm = RMSNorm(config.hidden_size, device=device)
-        if not self.lazy_load_embedding:
             self.embedding = torch.nn.Embedding(
                 config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
             )
-        if not self.lazy_load_unembedding:
             self.unembedding = torch.nn.Linear(
                 config.hidden_size,
                 config.vocab_size,
@@ -582,8 +578,8 @@ class Transformer(torch.nn.Module):
                 start_pos: int = 0,
                 ) -> tuple[
         torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
-        if self.lazy_load_embedding:
-            if not self.loaded[1] or self.extreme_low_memory:
+        if self.lazy_load:
+            if not self.loaded[1] or self.extremly_low_memory:
                 self.embedding = torch.nn.Embedding(
                     self.config.vocab_size, self.config.hidden_size, device=self.device, dtype=torch.bfloat16
                 )
@@ -591,7 +587,7 @@ class Transformer(torch.nn.Module):
                     self.load_weights(param, f"embedding.{name}")
                 self.loaded[1] = True
             x = self.embedding(x)
-            if self.extreme_low_memory:
+            if self.extremly_low_memory:
                 self.embedding = None
                 torch.cuda.empty_cache()
         else:
@@ -625,8 +621,8 @@ class Transformer(torch.nn.Module):
         else:
             x = self.norm(x)
 
-        if self.lazy_load_unembedding:
-            if not self.loaded[0] or self.extreme_low_memory:
+        if self.lazy_load:
+            if not self.loaded[0] or self.extremly_low_memory:
                 self.unembedding = torch.nn.Linear(
                     self.config.hidden_size,
                     self.config.vocab_size,
@@ -638,7 +634,7 @@ class Transformer(torch.nn.Module):
                     self.load_weights(param, f"unembedding.{name}")
                 self.loaded[0] = True
             x = self.unembedding(x)
-            if self.extreme_low_memory:
+            if self.extremly_low_memory:
                 self.unembedding = None
                 torch.cuda.empty_cache()
         else:
@@ -674,7 +670,7 @@ class Transformer(torch.nn.Module):
 
     @staticmethod
     def from_checkpoint(
-        path: str, device: str | torch.device = "cuda", lazy_load: bool = True
+        path: str, device: str | torch.device = "cuda", lazy_load: bool = True, pin_memory: bool = False
     ) -> "Transformer":
         if not isinstance(device, torch.device):
             device = torch.device(device)
@@ -684,15 +680,20 @@ class Transformer(torch.nn.Module):
             json_config = json.load(f)
             config = ModelConfig(**json_config)
 
+        extremly_low_memory = False
+        if not pin_memory:
+            extremly_low_memory = True
+
         model = Transformer(
             config=config,
             device=device,
+            extremly_low_memory=extremly_low_memory,
         )
         if not lazy_load:
             model.eval()
 
         global checkpoint
-        checkpoint = Checkpoint(path, device, True)
+        checkpoint = Checkpoint(path, device, pin_memory)
 
         if not lazy_load:
             # Load weights
@@ -729,9 +730,10 @@ class Transformer(torch.nn.Module):
 
 class TokenGenerator:
     @torch.inference_mode()
-    def __init__(self, checkpoint: str, device: torch.device):
+    def __init__(self, checkpoint: str, device: torch.device, pin_memory: bool = False):
         self.device = device
-        self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+        self.model = Transformer.from_checkpoint(
+            checkpoint, device=self.device, pin_memory=pin_memory)
 
     @torch.inference_mode()
     def generate(self,
