@@ -9,10 +9,15 @@ import datetime
 import os
 from pathlib import Path
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+
 try:
     import gnureadline as readline
 except ImportError:
-    import readline
+    try:
+        import readline
+    except ImportError:
+        import pyreadline3 as readline
 
 import torch
 import termcolor
@@ -80,8 +85,8 @@ def main(args):
 
     system_message_content = (
         SystemContent.new()
-        .with_reasoning_effort(REASONING_EFFORT[args.reasoning_effort])
-        .with_conversation_start_date(datetime.datetime.now().strftime("%Y-%m-%d"))
+        #.with_reasoning_effort(REASONING_EFFORT[args.reasoning_effort])
+        #.with_conversation_start_date(datetime.datetime.now().strftime("%Y-%m-%d"))
     )
 
     if args.browser:
@@ -245,7 +250,9 @@ def main(args):
         field_created = False
         current_output_text = ""
         output_text_delta_buffer = ""
-        for predicted_token in generator.generate(tokens, encoding.stop_tokens_for_assistant_actions()):
+        for predicted_token in generator.generate(tokens, encoding.stop_tokens_for_assistant_actions(),
+                                                  #temperature=0, max_tokens=10
+                                                  ):
             parser.process(predicted_token)
             if args.raw:
                 print(encoding.decode([predicted_token]), end="", flush=True)

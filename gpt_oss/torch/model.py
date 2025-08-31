@@ -52,34 +52,18 @@ class RMSNorm(torch.nn.Module):
         return (t * self.scale).to(dtype)
 
 
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    return torch.cat((o1, o2), dim=-1)
-
 def _apply_rotary_emb_optimized(
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
 ) -> torch.Tensor:
-    # Prepare cos/sin with correct shape and dtype outside this function
-    # Use direct indexing instead of chunk for better memory efficiency
     half_dim = x.size(-1) // 2
     x1, x2 = x[..., :half_dim], x[..., half_dim:]
 
-    # Compute in-place where possible
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
 
-    # Use view instead of cat to avoid memory allocation
-    return torch.cat([o1, o2], dim=-1)  # Still need cat, but optimized other parts
+    return torch.cat([o1, o2], dim=-1)
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -152,7 +136,6 @@ class RotaryEmbedding(torch.nn.Module):
         sin = freqs.sin() * concentration
         return cos, sin
 
-    @profile
     def forward(
             self,
             query: torch.Tensor,
@@ -241,38 +224,6 @@ class AttentionBlock(torch.nn.Module):
             device=device,
         )
 
-    def forward_(self, x: torch.Tensor) -> torch.Tensor:
-        t = self.norm(x)
-        qkv = self.qkv(t)
-        q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
-        k = qkv[
-            :,
-            self.num_attention_heads
-            * self.head_dim : (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
-        v = qkv[
-            :,
-            (self.num_attention_heads + self.num_key_value_heads)
-            * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
-            * self.head_dim,
-        ].contiguous()
-
-        q = q.view(
-            -1,
-            self.num_key_value_heads,
-            self.num_attention_heads // self.num_key_value_heads,
-            self.head_dim,
-        )
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
-        t = self.out(t)
-        t = x + t
-        return t
-
-    @profile
     def forward(self,
                 x: torch.Tensor,
                 past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -350,7 +301,7 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     return out_glu * (x_linear + 1)
 
 
-class MLPBlock(torch.nn.Module):
+class MLPBlock_(torch.nn.Module): # memory unefficient
     def __init__(
         self,
         config: ModelConfig,
@@ -429,6 +380,113 @@ class MLPBlock(torch.nn.Module):
 
         return x + t
 
+class MLPBlock(torch.nn.Module):
+    def __init__(
+            self,
+            config: ModelConfig,
+            device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.experts_per_token = config.experts_per_token
+        self.swiglu_limit = config.swiglu_limit
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.gate = torch.nn.Linear(
+            config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16
+        )
+        assert config.intermediate_size % self.world_size == 0
+        self.mlp1_weight = torch.nn.Parameter(
+            torch.empty(
+                (
+                    config.num_experts,
+                    config.intermediate_size * 2 // self.world_size,
+                    config.hidden_size,
+                ),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        )
+        self.mlp1_bias = torch.nn.Parameter(
+            torch.empty(
+                (config.num_experts, config.intermediate_size * 2 // self.world_size),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        )
+        self.mlp2_weight = torch.nn.Parameter(
+            torch.empty(
+                (
+                    config.num_experts,
+                    self.hidden_size,
+                    config.intermediate_size // self.world_size,
+                ),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        )
+        self.mlp2_bias = torch.nn.Parameter(
+            torch.empty(
+                (config.num_experts, self.hidden_size),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        t = self.norm(x)
+        g = self.gate(t)
+
+        if t.dim() == 2:
+            t = t.unsqueeze(1)
+            g = g.unsqueeze(1)
+            added_seq_dim = True
+        else:
+            added_seq_dim = False
+
+        batch_size, seq_len, hidden_size = t.shape
+
+        t_flat = t.reshape(-1, hidden_size)
+        g_flat = g.reshape(-1, self.num_experts)
+
+        experts = torch.topk(g_flat, k=self.experts_per_token, dim=-1, sorted=True)
+        expert_weights = torch.nn.functional.softmax(experts.values, dim=-1)
+        expert_indices = experts.indices
+
+        output_flat = torch.zeros_like(t_flat)
+
+        for k in range(self.experts_per_token):
+            current_expert_indices = expert_indices[:, k]
+            current_expert_weights = expert_weights[:, k]
+
+            mlp1_w = self.mlp1_weight[
+                current_expert_indices]
+            mlp1_b = self.mlp1_bias[current_expert_indices]
+            mlp2_w = self.mlp2_weight[
+                current_expert_indices]
+            mlp2_b = self.mlp2_bias[current_expert_indices]
+
+            t_k = torch.bmm(t_flat.unsqueeze(1), mlp1_w.transpose(1, 2)).squeeze(1) + mlp1_b
+            t_k = swiglu(t_k, limit=self.swiglu_limit)
+
+            t_k = torch.bmm(t_k.unsqueeze(1), mlp2_w.transpose(1, 2)).squeeze(1)
+
+            if self.world_size > 1:
+                dist.all_reduce(t_k, op=dist.ReduceOp.SUM)
+
+            t_k += mlp2_b
+
+            output_flat += t_k * current_expert_weights.unsqueeze(1)
+
+        output = output_flat.reshape(batch_size, seq_len, hidden_size)
+
+        if added_seq_dim:
+            output = output.squeeze(1)
+
+        return x + output
+
 
 class TransformerBlock(torch.nn.Module):
     def __init__(
@@ -455,32 +513,60 @@ class TransformerBlock(torch.nn.Module):
 
 checkpoint = None
 
+def get_free_gpu_memory_gb(device_id=0):
+    """Returns free GPU memory in GB for specified device (default: 0)"""
+    if not torch.cuda.is_available():
+        return 0.0
+
+    props = torch.cuda.get_device_properties(device_id)
+    total_memory = props.total_memory
+    reserved = torch.cuda.memory_reserved(device_id)
+
+    free_memory = total_memory - reserved
+    free_gb = free_memory / (1024 ** 3)
+
+    return free_gb
+
+
 class Transformer(torch.nn.Module):
     def __init__(
         self,
         config: ModelConfig,
         device: torch.device | None = None,
         lazy_load: bool = True,
+        extreme_low_memory: bool = False,
     ):
         super().__init__()
-        # lazy load layers
+        free_mem = get_free_gpu_memory_gb()
+        if free_mem < 6:
+            lazy_load = True
+            extreme_low_memory = True
+        elif free_mem < 8:
+            lazy_load = True
         self.lazy_load = lazy_load
-        if not self.lazy_load:
-            self.embedding = torch.nn.Embedding(
-                config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
-            )
+        self.lazy_load_embedding = lazy_load
+        self.lazy_load_unembedding = lazy_load
+        self.extreme_low_memory = extreme_low_memory
         self.config = config
         self.device = device
-
-        if not self.lazy_load:
+        self.loaded = {0: False, 1: False, 2: False}
+        if self.lazy_load:
+            self.block = torch.nn.ModuleList([
+                TransformerBlock(config, 0, device=device),
+            ])
+        else:
             self.block = torch.nn.ModuleList(
                 [
                     TransformerBlock(config, layer_idx, device)
                     for layer_idx in range(config.num_hidden_layers)
                 ]
             )
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        if not self.lazy_load:
+            self.norm = RMSNorm(config.hidden_size, device=device)
+        if not self.lazy_load_embedding:
+            self.embedding = torch.nn.Embedding(
+                config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
+            )
+        if not self.lazy_load_unembedding:
             self.unembedding = torch.nn.Linear(
                 config.hidden_size,
                 config.vocab_size,
@@ -496,14 +582,18 @@ class Transformer(torch.nn.Module):
                 start_pos: int = 0,
                 ) -> tuple[
         torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
-        if self.lazy_load:
-            embedding = torch.nn.Embedding(
-                self.config.vocab_size, self.config.hidden_size, device=self.device, dtype=torch.bfloat16
-            )
-            for name, param in embedding.named_parameters():
-                self.load_weights(param, f"embedding.{name}")
-            x = embedding(x)
-            del embedding
+        if self.lazy_load_embedding:
+            if not self.loaded[1] or self.extreme_low_memory:
+                self.embedding = torch.nn.Embedding(
+                    self.config.vocab_size, self.config.hidden_size, device=self.device, dtype=torch.bfloat16
+                )
+                for name, param in self.embedding.named_parameters():
+                    self.load_weights(param, f"embedding.{name}")
+                self.loaded[1] = True
+            x = self.embedding(x)
+            if self.extreme_low_memory:
+                self.embedding = None
+                torch.cuda.empty_cache()
         else:
             x = self.embedding(x)
 
@@ -512,33 +602,45 @@ class Transformer(torch.nn.Module):
 
         if self.lazy_load:
             for layer_idx in range(self.config.num_hidden_layers):
-                block = TransformerBlock(self.config, layer_idx, self.device)
-                for name, param in block.named_parameters():
+                # layers skipping experiment
+                #if layer_idx % 2 == 0:
+                #    continue
+                for name, param in self.block[0].named_parameters():
                     self.load_weights(param, f"block.{layer_idx}.{name}")
                 past_kv_for_layer = kv_cache[layer_idx]
-                x, new_kv_for_layer = block(x, past_kv_for_layer, start_pos)
+                x, new_kv_for_layer = self.block[0](x, past_kv_for_layer, start_pos)
                 kv_cache[layer_idx] = new_kv_for_layer
-                del block
         else:
             for layer_idx in range(self.config.num_hidden_layers):
                 past_kv_for_layer = kv_cache[layer_idx]
                 x, new_kv_for_layer = self.block[layer_idx](x, past_kv_for_layer, start_pos)
                 kv_cache[layer_idx] = new_kv_for_layer
 
-        x = self.norm(x)
-
         if self.lazy_load:
-            unembedding = torch.nn.Linear(
-                self.config.hidden_size,
-                self.config.vocab_size,
-                bias=False,
-                device=self.device,
-                dtype=torch.bfloat16,
-             )
-            for name, param in unembedding.named_parameters():
-                self.load_weights(param, f"unembedding.{name}")
-            x = unembedding(x)
-            del unembedding
+            norm = RMSNorm(self.config.hidden_size, device=self.device)
+            for name, param in norm.named_parameters():
+                self.load_weights(param, f"norm.{name}")
+            x = norm(x)
+            del norm
+        else:
+            x = self.norm(x)
+
+        if self.lazy_load_unembedding:
+            if not self.loaded[0] or self.extreme_low_memory:
+                self.unembedding = torch.nn.Linear(
+                    self.config.hidden_size,
+                    self.config.vocab_size,
+                    bias=False,
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                 )
+                for name, param in self.unembedding.named_parameters():
+                    self.load_weights(param, f"unembedding.{name}")
+                self.loaded[0] = True
+            x = self.unembedding(x)
+            if self.extreme_low_memory:
+                self.unembedding = None
+                torch.cuda.empty_cache()
         else:
             x = self.unembedding(x)
         return x, kv_cache
@@ -572,7 +674,7 @@ class Transformer(torch.nn.Module):
 
     @staticmethod
     def from_checkpoint(
-        path: str, device: str | torch.device = "cuda"
+        path: str, device: str | torch.device = "cuda", lazy_load: bool = True
     ) -> "Transformer":
         if not isinstance(device, torch.device):
             device = torch.device(device)
@@ -586,41 +688,41 @@ class Transformer(torch.nn.Module):
             config=config,
             device=device,
         )
-        model.eval()
-
-        # Load weights
-        my_rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        per_rank_intermediate_size = config.intermediate_size // world_size
+        if not lazy_load:
+            model.eval()
 
         global checkpoint
-        checkpoint = Checkpoint(path, device)
+        checkpoint = Checkpoint(path, device, True)
 
-        for name, param in model.named_parameters():
-            loaded_tensor = checkpoint.get(name)
-
-            # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-            # but for simplicity we do it after.
-            if "mlp1" in name:  # both weight and bias
-                loaded_tensor = loaded_tensor[
-                    :,
-                    my_rank * 2
-                    * per_rank_intermediate_size : (my_rank + 1) * 2
-                    * per_rank_intermediate_size,
-                    ...,
-                ]
-            elif "mlp2_weight" in name:  # only weight
-                loaded_tensor = loaded_tensor[
-                    ...,
-                    my_rank
-                    * per_rank_intermediate_size : (my_rank + 1)
-                    * per_rank_intermediate_size,
-                ]
-            try:
-                param.data.copy_(loaded_tensor)
-            except:
-                print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-                raise
+        if not lazy_load:
+            # Load weights
+            my_rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            per_rank_intermediate_size = config.intermediate_size // world_size
+            for name, param in model.named_parameters():
+                loaded_tensor = checkpoint.get(name)
+                # Note: it would be more efficient to do sharding before upcasting from MXFP4,
+                # but for simplicity we do it after.
+                if "mlp1" in name:  # both weight and bias
+                    loaded_tensor = loaded_tensor[
+                        :,
+                        my_rank * 2
+                        * per_rank_intermediate_size : (my_rank + 1) * 2
+                        * per_rank_intermediate_size,
+                        ...,
+                    ]
+                elif "mlp2_weight" in name:  # only weight
+                    loaded_tensor = loaded_tensor[
+                        ...,
+                        my_rank
+                        * per_rank_intermediate_size : (my_rank + 1)
+                        * per_rank_intermediate_size,
+                    ]
+                try:
+                    param.data.copy_(loaded_tensor)
+                except:
+                    print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
+                    raise
 
         return model
 
