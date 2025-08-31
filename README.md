@@ -26,6 +26,15 @@ Watch GPT-OSS 20B running on just 8GB of VRAM:
 
 *Click the image to watch the full demonstration* or -
 [Watch on YouTube](https://youtu.be/0g7MBALZM8c)
+
+<h2>UPDATE: 08/31/2025 - Added support 6 Gb VRAM for gpt-oss-20b !!!</h2>
+
+- Optimized MLPBlock
+- gpt_oss.generate min 6 Gb VRAM
+- gpt_oss.chat min 8 Gb VRAM
+- gpt_oss.chat windows support with pyreadline3 module
+- auto tune options for awailable VRAM
+
 __________________________________________
 
 Welcome to the gpt-oss series, [OpenAI's open-weight models](https://openai.com/open-models/) designed for powerful reasoning, agentic tasks, and versatile developer use cases.
